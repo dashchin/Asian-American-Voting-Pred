@@ -1,0 +1,549 @@
+---
+title: "GOV 51 Final Project"
+author: "Dash Chin"
+date: "4/16/2022"
+output:
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE) 
+library(haven)
+library(tidyverse) 
+library(readr) 
+library(readxl)
+library(leaps)
+library(caret)
+library(mfx)
+library(kableExtra) 
+library(tidyr) 
+library(broom)
+library(gtsummary)
+
+# LOAD DATA
+
+# For Dash
+
+# # ANES 2016 
+# anes <- read_dta("~/GOV 51 tutorials/Final Project/project data/anes_timeseries_2016.dta")
+# 
+# # ACS 115th Congress 
+# acs_115 <- read_csv("acs_115.csv")
+
+# For Alex
+
+#setwd("~/Desktop/gov51/final_project")
+
+anes <- read_dta("anes_timeseries_2016.dta")
+acs_115 <- read_csv("acs_115.csv")
+```
+
+# Data Processing
+
+## Manual Processing ANES 2016 + ACS 115th  
+## Combined dataset: merge
+
+```{r merge}
+asians <- subset(anes, V161310d == 1)
+
+#table(asians$V161010f) %>%  as.data.frame() %>% arrange(desc(Freq)) 
+
+
+# V161010f = district number, V161010e = State Abbr
+asians <- asians %>%  
+  rename(dist_num = V161010f) %>%  
+  mutate(dist_num = as.character(dist_num)) %>%  
+  mutate(dist_num = case_when(nchar(dist_num) == 1 ~ paste("0", dist_num, 
+                                                           sep = ""), 
+                              TRUE ~ dist_num)) %>%  
+  mutate(district = paste(V161010e, dist_num, sep = "-"))  
+
+
+acs_test <- acs_115 %>%  select(Code, `...12`) %>% 
+  rename (district = Code, 
+          aa_dist_share_vap = `...12`)
+
+
+# **MERGE ASIANS + ACS AA DIST SHARE**
+merge <- asians %>%  
+  merge(acs_test, by = "district") %>%  
+  mutate(aa_dist_share_vap = as.numeric(aa_dist_share_vap))
+
+# Debugging: DC not included in ACS :( 
+test <- asians  %>%  
+  mutate (good = V160001 %in% merge$V160001)
+
+```
+
+## Create Training Data
+
+```{r model_glm}
+
+# rename variables in a separate dataset. this is so we can apply the model
+# to the "test" data or 2020.  
+model_data <- merge %>%  
+  rename(vote_prior= V161005,  
+         party = V161019, 
+         economy = V161235, 
+         education = V161270, 
+         income = V161361x, 
+         vote_outcome = V162031) %>%  
+  mutate(vote_prior_binary = ifelse(vote_prior == 1, 1, 0),
+         vote_prior_binary = as.factor(vote_prior_binary),
+         vote_outcome_binary = ifelse(vote_outcome == 4 | V161024x == 4, 1, 0), 
+         vote_outcome_binary  = as.factor(vote_outcome_binary), 
+         party = case_when(party == 1 ~ "DEM" ,
+                          party == 2 ~ "REP", 
+                          party == -9 ~ "REFUSED",
+                          TRUE ~ "NONE OR INDEP"), 
+         economy = case_when(economy == 1 ~ "better", 
+                             economy == 2 ~ "worse", 
+                             TRUE  ~ "about the same"), 
+         education =case_when(education <= 8 ~ 1, 
+                              education > 8 & education < 17 ~ education - 7),
+         education = ifelse(education == 9, 8, education)) %>%  
+  filter(income != -9, 
+         income != -5)
+
+
+```
+
+## Manual Processing ANES 2020 + ACS 117th 
+## Combined dataset: merge_2020 
+
+```{r merge_2020}
+
+# read in acs_2018, rename columns, and create district
+acs_2018 <- read_excel("acs_2018.xlsx") %>%   
+  rename(abbr = `...2`, 
+         dist_num = `...4`,
+         aa_dist_share_vap = `...17`) %>% 
+  mutate(dist_num = case_when(nchar(dist_num) == 1 ~ paste("0", dist_num, sep = ""), 
+                              TRUE ~ dist_num)) %>%  
+  mutate(district = paste(abbr, dist_num, sep = "-"))
+
+# get asian pct and district only  
+acs_2018_narrow <- acs_2018 %>%  
+  select(district, aa_dist_share_vap) 
+
+anes_2020<- read_csv("anes_timeseries_2020_csv_20220210.csv") 
+
+cd_asian_reps <- read_excel("cd_asian_reps.xlsx")
+
+#filter anes to asians only
+asians_2020 <- anes_2020 %>%  
+  rename(dist_num = V203002) %>% 
+  filter(V201549x == 4) 
+
+# create district column in anes asians_2020
+asians_2020 <- asians_2020 %>%  
+  mutate(dist_num = as.character(dist_num)) %>% 
+  mutate(dist_num = case_when(nchar(dist_num) == 1 ~ paste("0", dist_num, 
+                                                           sep = ""),
+                              TRUE ~ dist_num), 
+         district = paste(V203001, dist_num, sep = "-") ) 
+
+# Final combo. 2 observations are dropped from the join
+merge_2020 <- asians_2020 %>%  
+  inner_join(acs_2018_narrow, by = "district") %>%  
+  # This is following Laura's suggestion for adding a 'Does respondent have an 
+  # Asian Rep' indicator variable. Here we create two for the Senate. 
+  mutate(aa_dist_share_vap = as.double(aa_dist_share_vap), 
+         asian_rep = ifelse(district %in% cd_asian_reps$house, TRUE, FALSE), 
+         asian_sen = ifelse(str_detect(district, "HI") | 
+                              str_detect(district, "IL"), TRUE, FALSE)) 
+
+
+# make vote_outcome_binary a numeric so that it's usable
+model_data$vote_outcome_binary <- as.numeric(model_data$vote_outcome_binary)-1  
+model_data$vote_outcome_binary
+```
+
+
+## Create TEST Data 
+
+```{r predictions model data}  
+
+# create newdata
+test_data <- merge_2020 %>%  
+  rename(vote_outcome = V202066, 
+         vote_prior = V201101,
+         party = V201018, 
+         economy = V201325, 
+         education = V201510, 
+         income = V202468x) %>%  
+  mutate(vote_outcome_binary = ifelse(vote_outcome == 4, 1, 0), 
+         vote_outcome_binary = as.factor(vote_outcome_binary),
+         vote_prior_binary = ifelse(vote_prior == 1, 1, 0), 
+         vote_prior_binary = as.factor(vote_prior_binary), 
+         economy = case_when(economy == 1 ~ "better", 
+                             economy == 2 ~ "worse", 
+                             TRUE  ~ "about the same"), 
+         party = case_when(party == 1 ~ "DEM" ,
+                          party == 2 ~ "REP", 
+                          party == -9 ~ "REFUSED",
+                          TRUE ~ "NONE OR INDEP")) %>%  
+  filter(income != -9, 
+         income != -5)  
+
+# make vote_outcome_binary a numeric so that it's usable
+test_data$vote_outcome_binary <- as.numeric(test_data$vote_outcome_binary)-1  
+test_data$vote_outcome_binary 
+
+# remove one NA because of missing district 
+test_data <- test_data %>% 
+  drop_na(aa_dist_share_vap)
+```
+
+ 
+
+
+The results from running this model show that the model is not very effective. None of the coefficients are statistically significant at the 5% level besides the coefficient for vote_prior_binary (this coefficient is statistically significant at the 0.1% level). The coefficient for vote_prior_binary indicates that there is an expected increase in log odds of the Asian American individual in-question voting (the outcome per-unite change) by 0.124% when said individual has voted in the previous election. This, of course, is a very small effect size. However, scholarship has found that whether or not someone has voted in the past is actually very predictive for whether they will vote in upcoming elections. More work needs to be done to isolate whether there is something wrong with our data/model, or that the effect of previously casting a ballot is uniquely small for Asian American voters.
+
+Even the intercept in the model is not statistically significant. This means that we do not know that the intercept could not be equal to zero; in other words, the intercept means nothing.
+
+While the coefficient is not statistically significant, the model predicts a high increase in propensity to vote for if the Asian American voter is highly educated. This matches previous literature on voter turnout.
+
+One measures goodness of fit of a logistic model by finding the value of 1 - (Residual Deviance/Null Deviance), with higher values corresponding to better fit (maximum is 1). The value for goodness of fit for this logistic model is 1 - (195.76/224.18), or 0.1268, indicating that the goodness of fit of this model is low. 
+
+
+# Model Selection 
+
+## Linear Probability Models 
+Here, we create a single variable Linear Probability Model and a multivariate 
+Linear Probability Model to see how the predictions 
+
+## Single Variable LPM
+
+proportion within interval [0,1]: 1 
+proportion correctly predicted: 0.5460526
+
+aa_dist_share_vap
+coefficient: 
+direction / magnitude: x
+significance:
+```{r model_lm}
+
+# set seed for prediction 
+set.seed(02169)
+
+# simple lpm for generating predictions
+mod_lpm_single <- lm(data = model_data, vote_outcome_binary ~  aa_dist_share_vap)
+
+# peep the coefficients: 0.0008729
+summary(mod_lpm_single)
+
+# generate predictions with lm
+pred.votes.lpm.single <-predict(mod_lpm_single, newdata = model_data, 
+                       type= "response")  
+
+# add it to the original dataset 
+model_data$pred_prob_single = pred.votes.lpm.single
+#model_data$pred_prob_single 
+
+# bias: proportion within unit interval (all of them are?)
+mean(model_data$pred_prob_single >= 0 & model_data$pred_prob_single <= 1) 
+
+# Single Variable LPM graph (y~x) 
+ggplot(model_data, aes(x=aa_dist_share_vap, y=vote_outcome_binary)) + 
+  geom_point() + 
+  geom_smooth(method = "lm", data = model_data, aes(x = aa_dist_share_vap, y = pred_prob_single), se = TRUE) + 
+  labs(title = "Single Variable Linear Probability Model") 
+
+# proportion correctly predicted: 0.5460526
+## first, round to 1 or 0 based on 0.5 threshold
+model_data$pred_round_single = ifelse(model_data$pred_prob_single >= 0.5, 1, 0) 
+model_data$pred_round_single
+
+## next find out accuracy
+mean(model_data$pred_round_single== model_data$vote_outcome_binary, na.rm = TRUE)
+
+```
+
+## Multivariate LPM 
+proportion within interval [0,1]: 1 
+proportion correctly predicted: 0.7039474 
+
+aa_dist_share_vap 
+coefficient: 0.0028717 
+direction / magnitude: low positive effect
+significance: 0.754
+
+```{r}
+
+# multivariate lm for generating predictions
+mod_lpm_multi <- lm(data = model_data, vote_outcome_binary ~ vote_prior_binary + as.factor(party) + 
+             as.factor(economy) + education + income +  aa_dist_share_vap +  I(aa_dist_share_vap^2))
+
+summary(mod_lpm_multi)
+
+## generate predictions with lm
+pred.votes.lpm.multi <-predict(mod_lpm_multi , newdata = model_data, 
+                       type= "response") 
+
+## add it to the original dataset
+model_data$pred_prob_multi = pred.votes.lpm.multi
+
+## bias = 0.9934211
+mean(model_data$pred_prob_multi  >= 0 & model_data$pred_prob_multi  <= 1)   
+
+summary(model_data$pred_prob_multi)
+
+## Visualization 
+ggplot(model_data, aes(x=aa_dist_share_vap, y=vote_outcome_binary)) + 
+  geom_point() + 
+  labs(title = "Multi Variable Linear Probability Model") + 
+  geom_smooth(method ="lm", data = model_data, aes(x = aa_dist_share_vap, y = pred_prob_multi), se = TRUE)
+
+
+
+##accuracy 0.7039474
+model_data$pred_round_multi = ifelse(model_data$pred_prob_multi >= 0.5, 1, 0) 
+model_data$pred_round_multi
+ 
+
+## next find out accuracy
+mean(model_data$pred_round_multi == model_data$vote_outcome_binary)
+```
+
+
+
+The linear model seems to be slightly more effective than the logistic model that was run above, in that, this time around, the coefficients for the intercept and vote_prior_binary are statistically significant beyond the 0.1% level. The intercept value, however, is virtually 0.
+
+The value for the coefficient of vote_prior_binary indicates that there is an increase in probability that an Asian American voter turns out by 0.0137% if they voted in a previous election. Once again, this is an extremely small effect size found by the model, which is contrary to the established literature on voter turnout which says that voter turnout propensity drastically increases if the individual in question has voted before. More work, therefore, must be done to either refine this model or demonstrate that the effect size of previous turnout on Asian Americans is uniquely small.
+
+While the coefficient is not statistically significant, the model predicts a high increase in propensity to vote for if the Asian American voter is highly educated. This matches previous literature on voter turnout.
+
+This model does not seem to fit the data particularly well, as shown by the low adjusted R-squared value of 0.1398.
+
+
+
+## Single variable logit with glm() 
+proportion within interval [0,1]: 1 
+proportion correctly predicted: 0.5460526 
+aa_dist_share_vap 
+coefficient: 0.003539   
+direction / magnitude: low positive effect 
+significance: 0.788
+
+```{r}
+
+glm_simple <- glm(vote_outcome_binary ~ aa_dist_share_vap, data = model_data,
+                   family = binomial)
+
+summary(glm_simple)
+
+# make the result 1 or zero based on threshold 
+pred_glm_single <- predict(glm_simple, newdata = model_data, 
+                       type= "response")
+pred_glm_single
+
+# add to dataset
+model_data$pred_prob_glm_single = pred_glm_single
+model_data$pred_prob_glm_single
+
+# bias, all are between 0 and 1  
+mean(model_data$pred_prob_glm_single >= 0 & model_data$pred_prob_glm_single <= 1, na.rm = TRUE)   
+
+# create rounded prediction
+model_data$pred_round_glm_single = ifelse(model_data$pred_prob_glm_single >= 0.5, 1, 0) 
+
+# proportion correctly predicted
+mean(model_data$pred_round_glm_single == model_data$vote_outcome_binary, na.rm = TRUE) 
+
+# visualization
+ggplot(model_data, aes(x=aa_dist_share_vap, y=vote_outcome_binary)) + 
+  geom_point() + 
+  labs(title = "Single Variable Logit Model") + 
+  geom_smooth(method ="lm", data = model_data, aes(x = aa_dist_share_vap, y = pred_prob_glm_single), se = TRUE)
+
+```
+
+
+## Multivariate logit with glm() 
+proportion within interval [0,1]: 1 
+proportion correctly predicted:  0.7105263 
+aa_dist_share_vap
+significance: 
+magnitude: low 
+```{r}
+
+# create model
+glm_multi <- glm(vote_outcome_binary ~ vote_prior_binary + as.factor(party) + 
+             as.factor(economy) + education + income +  aa_dist_share_vap +  I(aa_dist_share_vap^2), data = model_data, 
+                 family = binomial) 
+
+# only vote prior significant
+coeftest(glm_multi)
+
+# create predictions
+pred_glm_multi <- predict(glm_multi, newdata = model_data, type = "response") 
+
+# create 
+model_data$pred_prob_glm_multi = pred_glm_multi 
+
+# all within the thing
+mean(model_data$pred_prob_glm_multi>= 0 & model_data$pred_prob_glm_multi <= 1, na.rm = TRUE)   
+
+# create the rounded predcitions 0.7105263
+model_data$pred_round_glm_multi = ifelse(model_data$pred_prob_glm_multi >= 0.5, 1, 0) 
+
+# accuracy: find the proportion of accurate results  
+mean(model_data$pred_round_glm_multi == model_data$vote_outcome_binary)
+
+# visualization
+ggplot(model_data, aes(x=aa_dist_share_vap, y=vote_outcome_binary)) + 
+  geom_point() + 
+  labs(title = "Multivariate Logit Model") + 
+  geom_smooth(method ="lm", data = model_data, aes(x = aa_dist_share_vap, 
+                                                   y = pred_prob_glm_multi), se = TRUE)
+
+```
+
+
+
+
+# ## Logit mfx Marginal effects mfx
+
+Marginal effects for a logit regression - a measure of the instantaneous effect that a change in a particular explanatory variable has on the predicted probability of , when the other covariates are kept fixed. 
+
+Marginal effects show the change in probability when the predictor or
+independent variable increases by one
+unit. For continuous variables this
+represents the instantaneous change
+given that the ‘unit’ may be very
+small. For binary variables, the change
+is from 0 to 1, so one ‘unit’ as it is
+usually thought.
+
+
+```{r}
+
+# logitmfx 
+
+lmfx_single <- logitmfx(vote_outcome_binary ~ aa_dist_share_vap, 
+                    data = model_data) 
+
+
+lmfx_multi <- logitmfx(vote_outcome_binary ~ vote_prior_binary + party + 
+             economy + education +income +  aa_dist_share_vap +  I(aa_dist_share_vap^2), 
+                    data = model_data) 
+
+lmfx_single  
+
+
+lmfx_multi
+
+summary(test_data$aa_dist_share_vap)
+```
+
+
+# Making Predictions
+
+We have selected the multivariate glm() to predict  
+
+## Run predict() with newdata and GLM
+
+```{r predict}
+set.seed(02169) 
+
+# find the probabilities 
+pred_prob_glm_test<- predict(glm_multi, newdata = test_data, 
+                       type= "response") 
+
+# make the result 1 or zero based on threshold 
+pred_round_glm_test<- (predict(glm_multi, newdata = test_data, 
+                       type= "response") > 0.5) * 1 
+
+
+test_data <- test_data %>%  
+  mutate(pred_prob_glm_test = pred_prob_glm_test, 
+         pred_round_glm_test = pred_round_glm_test)
+
+mean(pred_round_glm_test == test_data$vote_outcome_binary) 
+
+
+# false negatives # 0.4456522
+test_data %>%  filter(vote_outcome_binary == 1 & pred_round_glm_test == 0) %>%  
+  nrow / nrow(test_data)  
+
+# false positives # 0.07246377
+test_data %>%  filter(vote_outcome_binary == 0 & pred_round_glm_test == 1) %>%  
+  nrow / nrow(test_data) 
+
+# bias calculation, all between 0 and 1 
+mean(test_data$pred_prob_glm_test >= 0 & test_data$pred_prob_glm_test <= 1)   
+
+# bias visualization
+ggplot(test_data, aes(x=aa_dist_share_vap, y=vote_outcome_binary)) + 
+  geom_point() + 
+  labs(title = "Multivariate Logit Model") + 
+  geom_smooth(method ="lm", data = test_data, aes(x = aa_dist_share_vap, 
+                                                   y = pred_prob_glm_test), se = TRUE)
+
+
+```
+
+
+# Summary Statistics 
+
+```{r summary statistics}
+
+
+# How many
+model_data %>%  
+  group_by(vote_outcome_binary) %>%  
+  summarize(average_aa_vap = mean(aa_dist_share_vap))
+
+# 2016 Election 
+counts2 <- table(model_data$vote_outcome_binary) 
+barplot(counts2, xlab = "Did Respondent Vote?", 
+        ylab = "Count", main = "Asian American Vote Turnout in 2016")
+# proportion no vote/vote
+# prop.table(table(model_data$vote_outcome_binary))
+
+# 2020 Election  
+counts <- table(test_data$vote_outcome_binary) 
+barplot(counts, xlab = "Did Respondent Vote?", 
+        ylab = "Count", main = "Asian American Vote Turnout in 2020") 
+
+
+
+
+nrow()
+
+prop.table(table(model_data$vote_outcome_binary))  
+
+# proportion no vote/vote
+prop.table(table(test_data$vote_outcome_binary))
+
+
+
+
+
+table(model_data$education)
+
+
+ggplot(test_data, aes(x = aa_dist_share_vap)) + 
+  geom_bar() + 
+  facet_wrap(~vote_outcome_binary)
+```
+
+
+# Limitations
+
+## Generalizability
+While we attempt to build a predictive model for Asian American voter turnout, because we use only limited survey data from 2016 and 2020, our findings will not be generalizable to:
+- Voters of other races
+- Voters outside the U.S.
+
+It will also be difficult to generalize our findings to non-presidential elections.
+
+Finally, given the quantitative nature of our analysis, while we can make claims about \emph{causal outcomes}--i.e., that certain factors influence Asian American voter turnout more than others--it is impossible for us to do anything but theorize on how such factors influence turnout; in other words, we cannot be in the business of making claims about \emph{causal mechanisms}.
+
+## Data
+- We're using 2018 data for ACS, corresponding to the 117th congress. The 2020 
+data is not available.
+- As Asian Americans are a smaller subset of the general population, survey data subsetted to only Asian American respondents is going to naturally yield a smaller-N analysis.
+
+
